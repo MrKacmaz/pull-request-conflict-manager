@@ -1,0 +1,102 @@
+name: Label PRs with Conflicts After Merge
+on:
+  pull_request:
+    types:
+      - closed
+    branches:
+      - master
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  label-conflicts:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Add conflict label to affected PRs
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const labelName = "conflict";
+            const baseBranch = "master";
+
+            const RETRIES = 6;
+            const DELAY_SECONDS = 10;
+
+            async function delay(seconds) {
+              return new Promise(resolve => setTimeout(resolve, seconds * 1000));
+            }
+
+            async function fetchPRWithRetry(prNumber) {
+              for (let attempt = 1; attempt <= RETRIES; attempt++) {
+                const { data: pr } = await github.rest.pulls.get({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: prNumber,
+                });
+
+                if (pr.mergeable !== null) {
+                  console.log(`[PR #${prNumber}] Mergeable status resolved: ${pr.mergeable}`);
+                  return pr;
+                }
+
+                console.log(`[PR #${prNumber}] Mergeable is null (Attempt ${attempt}/${RETRIES}). Retrying in ${DELAY_SECONDS}s...`);
+                await delay(DELAY_SECONDS);
+              }
+
+              throw new Error(`[PR #${prNumber}] Mergeable status is still null after ${RETRIES} attempts.`);
+            }
+
+            console.log("Fetching open PRs targeting base branch:", baseBranch);
+
+            const { data: pullRequests } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: "open",
+              base: baseBranch,
+            });
+
+            console.log(`Found ${pullRequests.length} open PR(s) targeting '${baseBranch}'. Checking for conflicts...`);
+
+            for (const pr of pullRequests) {
+              const prNumber = pr.number;
+              const fullPR = await fetchPRWithRetry(prNumber);
+
+              if (fullPR.mergeable === false) {
+                console.log(`[PR #${prNumber}] Conflict detected.`);
+
+                const { data: labels } = await github.rest.issues.listLabelsOnIssue({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                });
+
+                const hasLabel = labels.some(label => label.name === labelName);
+
+                if (!hasLabel) {
+                  console.log(`[PR #${prNumber}] Adding '${labelName}' label...`);
+
+                  await github.rest.issues.addLabels({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: prNumber,
+                    labels: [labelName],
+                  });
+
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: prNumber,
+                    body: `This pull request now has **merge conflicts**, likely due to the recent merge of **#${context.payload.pull_request.number}** into \`${baseBranch}\`.`,
+                  });
+
+                  console.log(`[PR #${prNumber}] Conflict label added and comment posted.`);
+                } else {
+                  console.log(`[PR #${prNumber}] Already has '${labelName}' label.`);
+                }
+              } else {
+                console.log(`[PR #${prNumber}] No conflict detected.`);
+              }
+            }
+
+            console.log("Conflict detection complete.");
